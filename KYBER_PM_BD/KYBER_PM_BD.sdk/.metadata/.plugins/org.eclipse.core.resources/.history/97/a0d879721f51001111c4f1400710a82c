@@ -1,0 +1,226 @@
+// ============================================================================
+// main.c -- Kyber Polynomial Multiplier on ZedBoard  (DEMO 版,詳細 Terminal 輸出)
+//   流程:
+//     1. SD 卡讀 pm_in_N.dat   -> in_buf  (256 word: a[128]+b[128])
+//     2. SD 卡讀 pm_gold_N.dat -> gold_buf(128 word: c[128])
+//     3. DMA MM2S 餵 256 word 進 PL (polymul_axi_top)
+//     4. DMA S2MM 收 128 word 結果回 DDR
+//     5. Terminal 詳細印出 a,b,c,golden 前 N 筆 + 逐筆比對 + 統計
+//
+//   .dat 格式: ASCII hex 無換行,每 8 hex = 1 個 32-bit word,
+//              word 內 byte-wise little-endian
+//   每個 32-bit word = 1 個 24-bit binomial: [23:12]=odd, [11:0]=even
+// ============================================================================
+#include <stdio.h>
+#include <string.h>
+#include "xil_printf.h"
+#include "xparameters.h"
+#include "xaxidma.h"
+#include "xtime_l.h"
+#include "ff.h"
+
+// ---------------------------------------------------------------------------
+#define N_IN_WORDS    256
+#define N_OUT_WORDS   128
+#define IN_BYTES      (N_IN_WORDS  * 4)
+#define OUT_BYTES     (N_OUT_WORDS * 4)
+#define DMA_DEV_ID    XPAR_AXIDMA_0_DEVICE_ID
+#define Q             3329
+#define SHOW_ROWS     8           // demo 印前幾筆 (改這個調整詳細度)
+
+static u32 in_buf  [N_IN_WORDS]  __attribute__((aligned(64)));
+static u32 out_buf [N_OUT_WORDS] __attribute__((aligned(64)));
+static u32 gold_buf[N_OUT_WORDS] __attribute__((aligned(64)));
+
+static XAxiDma AxiDma;
+static FATFS   fatfs;
+
+// ---------------------------------------------------------------------------
+int sd_mount(void)
+{
+    if (f_mount(&fatfs, "0:/", 1) != FR_OK) {
+        xil_printf("[SD] f_mount failed\r\n");
+        return XST_FAILURE;
+    }
+    return XST_SUCCESS;
+}
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int sd_read_dat(const char *fname, u32 *out, int n_words)
+{
+    FIL fil; FRESULT res; UINT br;
+    static char txt[N_IN_WORDS * 8 + 16];
+
+    res = f_open(&fil, fname, FA_READ);
+    if (res != FR_OK) { xil_printf("[SD] open %s fail (%d)\r\n", fname, res); return XST_FAILURE; }
+    res = f_read(&fil, txt, sizeof(txt) - 1, &br);
+    f_close(&fil);
+    if (res != FR_OK) { xil_printf("[SD] read %s fail (%d)\r\n", fname, res); return XST_FAILURE; }
+    txt[br] = '\0';
+
+    if ((int)br < n_words * 8) {
+        xil_printf("[SD] %s too short (%d/%d)\r\n", fname, br, n_words*8);
+        return XST_FAILURE;
+    }
+    for (int w = 0; w < n_words; w++) {
+        const char *p = &txt[w * 8];
+        int b0 = (hexval(p[0])<<4)|hexval(p[1]);
+        int b1 = (hexval(p[2])<<4)|hexval(p[3]);
+        int b2 = (hexval(p[4])<<4)|hexval(p[5]);
+        int b3 = (hexval(p[6])<<4)|hexval(p[7]);
+        out[w] = ((u32)b0)|((u32)b1<<8)|((u32)b2<<16)|((u32)b3<<24);
+    }
+    xil_printf("[SD] %s loaded (%d words)\r\n", fname, n_words);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+int dma_init(void)
+{
+    XAxiDma_Config *cfg = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (!cfg) { xil_printf("[DMA] LookupConfig fail\r\n"); return XST_FAILURE; }
+    if (XAxiDma_CfgInitialize(&AxiDma, cfg) != XST_SUCCESS) {
+        xil_printf("[DMA] CfgInit fail\r\n"); return XST_FAILURE;
+    }
+    if (XAxiDma_HasSg(&AxiDma)) { xil_printf("[DMA] SG unexpected\r\n"); return XST_FAILURE; }
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+    return XST_SUCCESS;
+}
+
+int dma_run_polymul(void)
+{
+    Xil_DCacheFlushRange((UINTPTR)in_buf,  IN_BYTES);
+    Xil_DCacheFlushRange((UINTPTR)out_buf, OUT_BYTES);
+
+    if (XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR)out_buf, OUT_BYTES,
+                               XAXIDMA_DEVICE_TO_DMA) != XST_SUCCESS) {
+        xil_printf("[DMA] S2MM start fail\r\n"); return XST_FAILURE;
+    }
+    if (XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR)in_buf, IN_BYTES,
+                               XAXIDMA_DMA_TO_DEVICE) != XST_SUCCESS) {
+        xil_printf("[DMA] MM2S start fail\r\n"); return XST_FAILURE;
+    }
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DMA_TO_DEVICE)) { }
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) { }
+
+    Xil_DCacheInvalidateRange((UINTPTR)out_buf, OUT_BYTES);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 把 24-bit packed binomial 拆成 odd / even (mod Q)
+static u32 odd_of (u32 w) { return ((w >> 12) & 0xFFF) % Q; }
+static u32 even_of(u32 w) { return ( w        & 0xFFF) % Q; }
+
+// 詳細印出一組測資的前 SHOW_ROWS 筆
+// 每個 binomial 表示為兩個係數 (odd = X^1 項, even = X^0 項)
+// 數學: c(x) = a(x) * b(x) mod (X^256+1), 每對 (even, odd) 是 deg-1 多項式
+void dump_detail(void)
+{
+    xil_printf("\r\n");
+    xil_printf("   i |    a[i]       |    b[i]       |   c[i] (HW)   |  c[i] (golden)| chk\r\n");
+    xil_printf("     | even   odd    | even   odd    | even   odd    | even   odd    |\r\n");
+    xil_printf("  ---+---------------+---------------+---------------+---------------+----\r\n");
+
+    for (int i = 0; i < SHOW_ROWS; i++) {
+        u32 a = in_buf[i]       & 0xFFFFFF;
+        u32 b = in_buf[i + 128] & 0xFFFFFF;
+        u32 c = out_buf[i]      & 0xFFFFFF;
+        u32 g = gold_buf[i]     & 0xFFFFFF;
+
+        int ok = (odd_of(c) == odd_of(g)) && (even_of(c) == even_of(g));
+
+        xil_printf("  %2d | %4u  %4u   | %4u  %4u   | %4u  %4u   | %4u  %4u   | %s\r\n",
+                   i,
+                   even_of(a), odd_of(a),
+                   even_of(b), odd_of(b),
+                   even_of(c), odd_of(c),
+                   even_of(g), odd_of(g),
+                   ok ? "OK " : "DIF");
+    }
+    xil_printf("  ... (first %d of %d binomials shown; all %d verified)\r\n",
+               SHOW_ROWS, N_OUT_WORDS, N_OUT_WORDS);
+}
+
+int verify(void)
+{
+    int errors = 0;
+    for (int i = 0; i < N_OUT_WORDS; i++) {
+        u32 c = out_buf[i]  & 0xFFFFFF;
+        u32 g = gold_buf[i] & 0xFFFFFF;
+        if (odd_of(c) != odd_of(g) || even_of(c) != even_of(g))
+            errors++;
+    }
+    return errors;
+}
+
+// ---------------------------------------------------------------------------
+int main(void)
+{
+    xil_printf("\r\n");
+    xil_printf("============================================================\r\n");
+    xil_printf("  Kyber Polynomial Multiplier  (ZedBoard / Zynq-7020)\r\n");
+    xil_printf("  c(x) = a(x) * b(x)  mod (X^256 + 1),  q = 3329\r\n");
+    xil_printf("  NTT(7-layer) -> PWM -> INTT ,  AXI4-Stream + DMA\r\n");
+    xil_printf("============================================================\r\n");
+
+    if (dma_init() != XST_SUCCESS) return -1;
+    xil_printf("[DMA] init OK\r\n");
+    if (sd_mount() != XST_SUCCESS) return -1;
+    xil_printf("[SD ] mounted\r\n");
+
+    int total_fail = 0;
+    int sum_us = 0;
+
+    for (int tc = 0; tc < 5; tc++) {
+        char fn_in[16], fn_gold[16];
+        strcpy(fn_in,   "pm_in_0.dat");   fn_in[6]   = '0' + tc;
+        strcpy(fn_gold, "pm_gold_0.dat"); fn_gold[8] = '0' + tc;
+
+        xil_printf("\r\n------------------------------------------------------------\r\n");
+        xil_printf(" Test case %d\r\n", tc);
+        xil_printf("------------------------------------------------------------\r\n");
+
+        if (sd_read_dat(fn_in,   in_buf,   N_IN_WORDS)  != XST_SUCCESS) break;
+        if (sd_read_dat(fn_gold, gold_buf, N_OUT_WORDS) != XST_SUCCESS) break;
+
+        XTime t0, t1;
+        XTime_GetTime(&t0);
+        if (dma_run_polymul() != XST_SUCCESS) { total_fail++; continue; }
+        XTime_GetTime(&t1);
+        int us = (int)(1.0e6 * (double)(t1 - t0) / (double)COUNTS_PER_SECOND);
+        sum_us += us;
+
+        dump_detail();
+
+        int err = verify();
+        xil_printf("\r\n  result: %d / %d binomials match,  latency = %d us (incl. SD+DMA)\r\n",
+                   N_OUT_WORDS - err, N_OUT_WORDS, us);
+        if (err == 0)
+            xil_printf("  >>> CASE %d  PASS <<<\r\n", tc);
+        else {
+            xil_printf("  >>> CASE %d  FAIL (%d mismatch) <<<\r\n", tc, err);
+            total_fail++;
+        }
+    }
+
+    xil_printf("\r\n============================================================\r\n");
+    if (total_fail == 0)
+        xil_printf("  SUMMARY:  ALL PASS  (5/5 cases, avg %d us/poly-mul)\r\n",
+                   sum_us / 5);
+    else
+        xil_printf("  SUMMARY:  %d / 5 cases FAILED\r\n", total_fail);
+    xil_printf("  Pure HW compute: 1647 cycles @ 90 MHz ~= 18.3 us\r\n");
+    xil_printf("============================================================\r\n");
+
+    while (1) { }
+    return 0;
+}

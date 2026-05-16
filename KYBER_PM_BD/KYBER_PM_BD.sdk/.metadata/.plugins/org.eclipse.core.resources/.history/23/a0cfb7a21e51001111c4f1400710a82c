@@ -1,0 +1,241 @@
+// ============================================================================
+// main.c -- Kyber Polynomial Multiplier on ZedBoard
+//   流程 (對照 softmax lab):
+//     1. SD 卡讀 pm_in_0.dat   → input 緩衝 (256 word: a[128]+b[128])
+//     2. SD 卡讀 pm_gold_0.dat → golden  緩衝 (128 word: c[128])
+//     3. DMA MM2S 把 256 word 餵進 PL (polymul_axi_top)
+//     4. DMA S2MM 收 128 word 結果回 DDR
+//     5. 跟 golden 比對,印 PASS/FAIL,並量測 cycle
+//
+//   資料格式 (.dat): ASCII hex 無換行,每 8 hex = 1 個 32-bit word,
+//                    word 內 byte-wise little-endian (跟 softmax lab 一致)
+//   每個 32-bit word = 1 個 24-bit binomial (上 8-bit = 0)
+// ============================================================================
+#include <stdio.h>
+#include <string.h>
+#include "xil_printf.h"
+#include "xparameters.h"
+#include "xaxidma.h"
+#include "xtime_l.h"
+#include "ff.h"          // xilffs (FatFs)
+
+// ---------------------------------------------------------------------------
+// 參數
+// ---------------------------------------------------------------------------
+#define N_IN_WORDS   256          // a[128] + b[128]
+#define N_OUT_WORDS  128          // c[128]
+#define IN_BYTES     (N_IN_WORDS  * 4)
+#define OUT_BYTES    (N_OUT_WORDS * 4)
+
+#define DMA_DEV_ID   XPAR_AXIDMA_0_DEVICE_ID
+
+// DDR buffer (cache-line 對齊)
+static u32 in_buf  [N_IN_WORDS]  __attribute__((aligned(64)));
+static u32 out_buf [N_OUT_WORDS] __attribute__((aligned(64)));
+static u32 gold_buf[N_OUT_WORDS] __attribute__((aligned(64)));
+
+static XAxiDma AxiDma;
+static FATFS   fatfs;
+
+// ---------------------------------------------------------------------------
+// SD 卡: 掛載
+// ---------------------------------------------------------------------------
+int sd_mount(void)
+{
+    FRESULT res = f_mount(&fatfs, "0:/", 1);
+    if (res != FR_OK) {
+        xil_printf("[SD] f_mount failed (%d)\r\n", res);
+        return XST_FAILURE;
+    }
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// SD 卡: 讀 ASCII-hex .dat,解析成 u32 word array (byte-wise little-endian)
+//   hex8 = "b0 b1 b2 b3" → word = b0 | b1<<8 | b2<<16 | b3<<24
+// ---------------------------------------------------------------------------
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int sd_read_dat(const char *fname, u32 *out, int n_words)
+{
+    FIL  fil;
+    FRESULT res;
+    UINT  br;
+    static char txt[N_IN_WORDS * 8 + 16];   // 最大 input = 2048 chars
+
+    res = f_open(&fil, fname, FA_READ);
+    if (res != FR_OK) {
+        xil_printf("[SD] f_open %s failed (%d)\r\n", fname, res);
+        return XST_FAILURE;
+    }
+
+    res = f_read(&fil, txt, sizeof(txt) - 1, &br);
+    f_close(&fil);
+    if (res != FR_OK) {
+        xil_printf("[SD] f_read %s failed (%d)\r\n", fname, res);
+        return XST_FAILURE;
+    }
+    txt[br] = '\0';
+
+    int need = n_words * 8;
+    if ((int)br < need) {
+        xil_printf("[SD] %s too short: got %d chars, need %d\r\n",
+                   fname, br, need);
+        return XST_FAILURE;
+    }
+
+    for (int w = 0; w < n_words; w++) {
+        const char *p = &txt[w * 8];
+        int b0 = (hexval(p[0]) << 4) | hexval(p[1]);
+        int b1 = (hexval(p[2]) << 4) | hexval(p[3]);
+        int b2 = (hexval(p[4]) << 4) | hexval(p[5]);
+        int b3 = (hexval(p[6]) << 4) | hexval(p[7]);
+        out[w] = ((u32)b0)       | ((u32)b1 << 8) |
+                 ((u32)b2 << 16) | ((u32)b3 << 24);
+    }
+    xil_printf("[SD] %s loaded (%d words)\r\n", fname, n_words);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// DMA 初始化
+// ---------------------------------------------------------------------------
+int dma_init(void)
+{
+    XAxiDma_Config *cfg = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (!cfg) { xil_printf("[DMA] LookupConfig failed\r\n"); return XST_FAILURE; }
+
+    if (XAxiDma_CfgInitialize(&AxiDma, cfg) != XST_SUCCESS) {
+        xil_printf("[DMA] CfgInitialize failed\r\n");
+        return XST_FAILURE;
+    }
+    if (XAxiDma_HasSg(&AxiDma)) {
+        xil_printf("[DMA] SG mode not expected\r\n");
+        return XST_FAILURE;
+    }
+    // 關閉中斷,用 polling
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// DMA 一次 polymul: 送 256 word, 收 128 word
+// ---------------------------------------------------------------------------
+int dma_run_polymul(void)
+{
+    int status;
+
+    // cache flush (DDR → 給 DMA 讀的最新資料)
+    Xil_DCacheFlushRange((UINTPTR)in_buf,  IN_BYTES);
+    Xil_DCacheFlushRange((UINTPTR)out_buf, OUT_BYTES);
+
+    // 先啟動 S2MM (接收),再啟動 MM2S (送出)
+    status = XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR)out_buf,
+                                    OUT_BYTES, XAXIDMA_DEVICE_TO_DMA);
+    if (status != XST_SUCCESS) {
+        xil_printf("[DMA] S2MM start failed\r\n");
+        return XST_FAILURE;
+    }
+
+    status = XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR)in_buf,
+                                    IN_BYTES, XAXIDMA_DMA_TO_DEVICE);
+    if (status != XST_SUCCESS) {
+        xil_printf("[DMA] MM2S start failed\r\n");
+        return XST_FAILURE;
+    }
+
+    // 等兩邊都完成 (polling)
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DMA_TO_DEVICE))  { /* wait MM2S */ }
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA))  { /* wait S2MM */ }
+
+    // invalidate cache (DDR ← DMA 寫回的結果)
+    Xil_DCacheInvalidateRange((UINTPTR)out_buf, OUT_BYTES);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 驗證: out_buf vs gold_buf (各 24-bit, mod 3329 比對)
+// ---------------------------------------------------------------------------
+#define Q 3329
+int verify(void)
+{
+    int errors = 0;
+    for (int i = 0; i < N_OUT_WORDS; i++) {
+        u32 got  = out_buf[i]  & 0xFFFFFF;
+        u32 gold = gold_buf[i] & 0xFFFFFF;
+
+        u32 got_odd  = (got  >> 12) & 0xFFF;
+        u32 got_even =  got        & 0xFFF;
+        u32 g_odd    = (gold >> 12) & 0xFFF;
+        u32 g_even   =  gold       & 0xFFF;
+
+        if ((got_odd % Q) != (g_odd % Q) ||
+            (got_even % Q) != (g_even % Q)) {
+            if (errors < 8)
+                xil_printf("  FAIL[%3d] got=%06x gold=%06x\r\n",
+                           i, got, gold);
+            errors++;
+        }
+    }
+    return errors;
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+int main(void)
+{
+    xil_printf("\r\n=== Kyber Polynomial Multiplier (ZedBoard) ===\r\n");
+
+    if (dma_init() != XST_SUCCESS)  return -1;
+    xil_printf("[DMA] init OK\r\n");
+
+    if (sd_mount() != XST_SUCCESS)  return -1;
+    xil_printf("[SD] mounted\r\n");
+
+    // ---- 跑 5 組測資 ----
+    int total_fail = 0;
+    for (int tc = 0; tc < 5; tc++) {
+        char fn_in[16], fn_gold[16];
+        // 組檔名: pm_in_0.dat / pm_gold_0.dat
+        // (簡單手組,避免 sprintf 依賴)
+        strcpy(fn_in,   "pm_in_0.dat");   fn_in[6]   = '0' + tc;
+        strcpy(fn_gold, "pm_gold_0.dat"); fn_gold[8] = '0' + tc;
+
+        xil_printf("\r\n--- Test case %d ---\r\n", tc);
+
+        if (sd_read_dat(fn_in,   in_buf,   N_IN_WORDS)  != XST_SUCCESS) break;
+        if (sd_read_dat(fn_gold, gold_buf, N_OUT_WORDS) != XST_SUCCESS) break;
+
+        XTime t0, t1;
+        XTime_GetTime(&t0);
+        if (dma_run_polymul() != XST_SUCCESS) { total_fail++; continue; }
+        XTime_GetTime(&t1);
+
+        // COUNTS_PER_SECOND 來自 xtime_l.h (Cortex-A9: 333.33 MHz global timer)
+        double us = 1.0e6 * (double)(t1 - t0) / (double)COUNTS_PER_SECOND;
+
+        int err = verify();
+        if (err == 0)
+            xil_printf("  PASS  (%d words OK, %d us incl. DMA)\r\n",
+                       N_OUT_WORDS, (int)us);
+        else {
+            xil_printf("  FAIL  (%d / %d words mismatch)\r\n",
+                       err, N_OUT_WORDS);
+            total_fail++;
+        }
+    }
+
+    xil_printf("\r\n=== Summary: %s (%d/5 cases failed) ===\r\n",
+               total_fail == 0 ? "ALL PASS" : "SOME FAIL", total_fail);
+
+    while (1) { }
+    return 0;
+}

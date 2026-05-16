@@ -1,14 +1,14 @@
 `timescale 1ns/1ps
 `include "kyber_params.v"
 // =============================================================================
-// tb_polymul_multi.v -- 5 çµ„ç¨ç«‹ polynomial multiplication æ¸¬è©¦
+// tb_polymul_multi.v -- 5 çµ„ç¨ç«? polynomial multiplication æ¸¬è©¦
 // -----------------------------------------------------------------------------
-// 5 å€‹ç¨ç«‹ polymul_top instance,å„è‡ªè¼‰ä¸åŒ (a, b) testvector,
-// åŒæ™‚è·‘,å„è‡ª dump BRAM_A è·Ÿ schoolbook çµæœæ¯”å°ã€‚
+// 5 ?‹ç¨ç«? polymul_top instance,??„è‡ªè¼‰ä?å?? (a, b) testvector,
+// ??Œæ?‚è??,??„è‡ª dump BRAM_A è·? schoolbook çµæ?œæ?”å?ã??
 //
-// é©—è­‰:
-//   (1) DUT å°ä¸åŒ input éƒ½ç®—å°
-//   (2) è¨­è¨ˆæ²’æœ‰ cross-instance state pollution
+// é©—è??:
+//   (1) DUT å°ä?å?? input ?ƒ½ç®—å??
+//   (2) è¨­è?ˆæ?’æ?? cross-instance state pollution
 // =============================================================================
 module tb_polymul_multi;
 
@@ -18,7 +18,7 @@ module tb_polymul_multi;
     reg         rst_n;
     reg         start;
 
-    // 5 å€‹ DUT instance
+    // 5 ?? DUT instance
     wire        busy0, done0, busy1, done1, busy2, done2, busy3, done3, busy4, done4;
     reg  [6:0]  dbg_addr;
     reg  [1:0]  dbg_sel;
@@ -90,7 +90,7 @@ module tb_polymul_multi;
         $readmemh("tv_polymul_4_c_bram.memh", gold4);
 
         rst_n = 1'b0; start = 1'b0;
-        dbg_addr = 0; dbg_sel = 2'd0;     // éƒ½è®€ BRAM_A
+        dbg_addr = 0; dbg_sel = 2'd0;     // ?ƒ½è®? BRAM_A
 
         @(posedge clk); @(posedge clk);
         @(negedge clk); rst_n = 1'b1;
@@ -112,7 +112,7 @@ module tb_polymul_multi;
 
         repeat (4) @(posedge clk);
 
-        // é€ entry æ¯”å°æ¯çµ„
+        // ?? entry æ¯”å?æ?ç??
         for (i = 0; i < 128; i = i + 1) begin
             @(negedge clk);
             dbg_addr = i[6:0];
@@ -153,7 +153,7 @@ module tb_polymul_multi;
         $display("  polymul_3 (seed 1/2):         errors = %0d", e3);
         $display("  polymul_4 (seed 0/1):         errors = %0d", e4);
         if (e0+e1+e2+e3+e4 == 0)
-            $display("[tb_polymul_multi] OVERALL PASS  (5 polymul Ã— 128 entries = 640 values)");
+            $display("[tb_polymul_multi] OVERALL PASS  (5 polymul ?? 128 entries = 640 values)");
         else
             $display("[tb_polymul_multi] OVERALL FAIL  (%0d total errors)", e0+e1+e2+e3+e4);
 

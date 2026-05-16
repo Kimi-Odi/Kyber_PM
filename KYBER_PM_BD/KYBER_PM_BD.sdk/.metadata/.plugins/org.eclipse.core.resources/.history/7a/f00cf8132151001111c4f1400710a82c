@@ -1,0 +1,326 @@
+// ============================================================================
+// main.c -- Kyber Polynomial Multiplier on ZedBoard  (五階段資料流 DEMO 版)
+// ----------------------------------------------------------------------------
+//   Terminal 完整呈現:
+//     原始 a, b
+//       -> NTT(a)=â , NTT(b)=b̂        (PS 軟體算,展示演算法)
+//       -> PWM(â,b̂)=ĉ
+//       -> INTT(ĉ)=c                  (PS 軟體算)
+//     並與「硬體 PL 從 DMA 回傳的 c」+「SD 卡 golden」三方比對
+//
+//   PS 軟體 NTT/INTT/PWM 一字一句對應 ref_model.py / pqcrystals-kyber,
+//   也就是 RTL 實作的同一套演算法 (n=256, q=3329, zeta=17, fused INTT)。
+//
+//   .dat 格式: ASCII hex 無換行,每 8 hex = 1 個 32-bit word (LE),
+//              每 word = 1 個 24-bit binomial: [23:12]=odd, [11:0]=even
+// ============================================================================
+#include <stdio.h>
+#include <string.h>
+#include "xil_printf.h"
+#include "xparameters.h"
+#include "xaxidma.h"
+#include "xtime_l.h"
+#include "ff.h"
+
+typedef unsigned short u16;
+
+#define N            256
+#define Q            3329
+#define INV2         1665          // 2^-1 mod 3329
+#define N_IN_WORDS   256
+#define N_OUT_WORDS  128
+#define IN_BYTES     (N_IN_WORDS  * 4)
+#define OUT_BYTES    (N_OUT_WORDS * 4)
+#define DMA_DEV_ID   XPAR_AXIDMA_0_DEVICE_ID
+#define SHOW_ROWS    4             // 每階段印前幾個 binomial
+
+static u32 in_buf  [N_IN_WORDS]  __attribute__((aligned(64)));
+static u32 out_buf [N_OUT_WORDS] __attribute__((aligned(64)));
+static u32 gold_buf[N_OUT_WORDS] __attribute__((aligned(64)));
+
+static XAxiDma AxiDma;
+static FATFS   fatfs;
+
+// 軟體運算用 (256 個係數)
+static int sw_a[N], sw_b[N];
+static int sw_an[N], sw_bn[N];     // NTT(a), NTT(b)
+static int sw_cn[N];               // PWM 結果
+static int sw_c[N];                // INTT 結果 = 最終 c
+
+// ---------------------------------------------------------------------------
+// Twiddle 表 (= ref_model.py 的 ZETAS / ZETAS_PWM)
+// ---------------------------------------------------------------------------
+static const u16 ZETAS[128] = {
+    1, 1729, 2580, 3289, 2642, 630, 1897, 848,
+    1062, 1919, 193, 797, 2786, 3260, 569, 1746,
+    296, 2447, 1339, 1476, 3046, 56, 2240, 1333,
+    1426, 2094, 535, 2882, 2393, 2879, 1974, 821,
+    289, 331, 3253, 1756, 1197, 2304, 2277, 2055,
+    650, 1977, 2513, 632, 2865, 33, 1320, 1915,
+    2319, 1435, 807, 452, 1438, 2868, 1534, 2402,
+    2647, 2617, 1481, 648, 2474, 3110, 1227, 910,
+    17, 2761, 583, 2649, 1637, 723, 2288, 1100,
+    1409, 2662, 3281, 233, 756, 2156, 3015, 3050,
+    1703, 1651, 2789, 1789, 1847, 952, 1461, 2687,
+    939, 2308, 2437, 2388, 733, 2337, 268, 641,
+    1584, 2298, 2037, 3220, 375, 2549, 2090, 1645,
+    1063, 319, 2773, 757, 2099, 561, 2466, 2594,
+    2804, 1092, 403, 1026, 1143, 2150, 2775, 886,
+    1722, 1212, 1874, 1029, 2110, 2935, 885, 2154,
+};
+static const u16 ZETAS_PWM[128] = {
+    17, 3312, 2761, 568, 583, 2746, 2649, 680,
+    1637, 1692, 723, 2606, 2288, 1041, 1100, 2229,
+    1409, 1920, 2662, 667, 3281, 48, 233, 3096,
+    756, 2573, 2156, 1173, 3015, 314, 3050, 279,
+    1703, 1626, 1651, 1678, 2789, 540, 1789, 1540,
+    1847, 1482, 952, 2377, 1461, 1868, 2687, 642,
+    939, 2390, 2308, 1021, 2437, 892, 2388, 941,
+    733, 2596, 2337, 992, 268, 3061, 641, 2688,
+    1584, 1745, 2298, 1031, 2037, 1292, 3220, 109,
+    375, 2954, 2549, 780, 2090, 1239, 1645, 1684,
+    1063, 2266, 319, 3010, 2773, 556, 757, 2572,
+    2099, 1230, 561, 2768, 2466, 863, 2594, 735,
+    2804, 525, 1092, 2237, 403, 2926, 1026, 2303,
+    1143, 2186, 2150, 1179, 2775, 554, 886, 2443,
+    1722, 1607, 1212, 2117, 1874, 1455, 1029, 2300,
+    2110, 1219, 2935, 394, 885, 2444, 2154, 1175,
+};
+
+static inline int modq(int x) { x %= Q; if (x < 0) x += Q; return x; }
+
+// ---------------------------------------------------------------------------
+// PS 軟體 NTT (DIT) -- 對應 ref_model.py ntt()
+// ---------------------------------------------------------------------------
+void sw_ntt(int *a)
+{
+    int k = 1, length = 128;
+    while (length >= 2) {
+        for (int start = 0; start < N; start += 2 * length) {
+            int zeta = ZETAS[k++];
+            for (int j = start; j < start + length; j++) {
+                int t = modq(zeta * a[j + length]);
+                a[j + length] = modq(a[j] - t);
+                a[j]          = modq(a[j] + t);
+            }
+        }
+        length >>= 1;
+    }
+}
+
+// PS 軟體 INTT (fused ÷2 GS-DIF) -- 對應 ref_model.py intt()
+void sw_intt(int *a)
+{
+    int k = 127, length = 2;
+    while (length <= 128) {
+        for (int start = 0; start < N; start += 2 * length) {
+            int zeta = ZETAS[k--];
+            for (int j = start; j < start + length; j++) {
+                int t = a[j];
+                a[j]          = modq((t + a[j + length]) * INV2);
+                a[j + length] = modq((a[j + length] - t) * INV2);
+                a[j + length] = modq(zeta * a[j + length]);
+            }
+        }
+        length <<= 1;
+    }
+}
+
+// PS 軟體 PWM -- 對應 ref_model.py pwm()
+void sw_pwm(const int *a, const int *b, int *r)
+{
+    for (int i = 0; i < 128; i++) {
+        int a0 = a[2*i], a1 = a[2*i + 1];
+        int b0 = b[2*i], b1 = b[2*i + 1];
+        int z  = ZETAS_PWM[i];
+        r[2*i]     = modq(a0*b0 + modq(a1*b1) * z);
+        r[2*i + 1] = modq(a0*b1 + a1*b0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SD 卡
+// ---------------------------------------------------------------------------
+int sd_mount(void)
+{
+    if (f_mount(&fatfs, "0:/", 1) != FR_OK) {
+        xil_printf("[SD] f_mount failed\r\n"); return XST_FAILURE;
+    }
+    return XST_SUCCESS;
+}
+static int hexval(char c)
+{
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='a'&&c<='f') return c-'a'+10;
+    if (c>='A'&&c<='F') return c-'A'+10;
+    return -1;
+}
+int sd_read_dat(const char *fn, u32 *out, int nw)
+{
+    FIL f; FRESULT r; UINT br;
+    static char txt[N_IN_WORDS*8+16];
+    if (f_open(&f,fn,FA_READ)!=FR_OK){xil_printf("[SD] open %s fail\r\n",fn);return XST_FAILURE;}
+    r=f_read(&f,txt,sizeof(txt)-1,&br); f_close(&f);
+    if (r!=FR_OK){xil_printf("[SD] read %s fail\r\n",fn);return XST_FAILURE;}
+    txt[br]='\0';
+    if ((int)br < nw*8){xil_printf("[SD] %s short\r\n",fn);return XST_FAILURE;}
+    for (int w=0;w<nw;w++){
+        const char*p=&txt[w*8];
+        int b0=(hexval(p[0])<<4)|hexval(p[1]);
+        int b1=(hexval(p[2])<<4)|hexval(p[3]);
+        int b2=(hexval(p[4])<<4)|hexval(p[5]);
+        int b3=(hexval(p[6])<<4)|hexval(p[7]);
+        out[w]=((u32)b0)|((u32)b1<<8)|((u32)b2<<16)|((u32)b3<<24);
+    }
+    xil_printf("[SD] %s loaded (%d words)\r\n",fn,nw);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// DMA
+// ---------------------------------------------------------------------------
+int dma_init(void)
+{
+    XAxiDma_Config *c = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (!c){xil_printf("[DMA] lookup fail\r\n");return XST_FAILURE;}
+    if (XAxiDma_CfgInitialize(&AxiDma,c)!=XST_SUCCESS){xil_printf("[DMA] init fail\r\n");return XST_FAILURE;}
+    if (XAxiDma_HasSg(&AxiDma)){xil_printf("[DMA] SG?\r\n");return XST_FAILURE;}
+    XAxiDma_IntrDisable(&AxiDma,XAXIDMA_IRQ_ALL_MASK,XAXIDMA_DEVICE_TO_DMA);
+    XAxiDma_IntrDisable(&AxiDma,XAXIDMA_IRQ_ALL_MASK,XAXIDMA_DMA_TO_DEVICE);
+    return XST_SUCCESS;
+}
+int dma_run(void)
+{
+    Xil_DCacheFlushRange((UINTPTR)in_buf,IN_BYTES);
+    Xil_DCacheFlushRange((UINTPTR)out_buf,OUT_BYTES);
+    if (XAxiDma_SimpleTransfer(&AxiDma,(UINTPTR)out_buf,OUT_BYTES,XAXIDMA_DEVICE_TO_DMA)!=XST_SUCCESS)
+        return XST_FAILURE;
+    if (XAxiDma_SimpleTransfer(&AxiDma,(UINTPTR)in_buf,IN_BYTES,XAXIDMA_DMA_TO_DEVICE)!=XST_SUCCESS)
+        return XST_FAILURE;
+    while (XAxiDma_Busy(&AxiDma,XAXIDMA_DMA_TO_DEVICE)){}
+    while (XAxiDma_Busy(&AxiDma,XAXIDMA_DEVICE_TO_DMA)){}
+    Xil_DCacheInvalidateRange((UINTPTR)out_buf,OUT_BYTES);
+    return XST_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 印一個階段的前 SHOW_ROWS 個 binomial:  idx | even + odd*X
+// poly[] 是 256 個係數: poly[2i]=even, poly[2i+1]=odd
+// ---------------------------------------------------------------------------
+void print_stage(const char *title, const int *poly)
+{
+    xil_printf("  [%s]\r\n", title);
+    for (int i = 0; i < SHOW_ROWS; i++) {
+        xil_printf("     [%2d] %4d + %4d*X\r\n",
+                   i, poly[2*i] % Q, poly[2*i+1] % Q);
+    }
+}
+
+int main(void)
+{
+    xil_printf("\r\n");
+    xil_printf("================================================================\r\n");
+    xil_printf("  Kyber Polynomial Multiplier  (ZedBoard / Zynq-7020)\r\n");
+    xil_printf("  c(x) = a(x) * b(x)  mod (X^256 + 1),  q = 3329, zeta = 17\r\n");
+    xil_printf("  Data flow:  a,b -> NTT -> PWM -> INTT -> c\r\n");
+    xil_printf("  3-way check:  PS-software  vs  PL-hardware  vs  golden\r\n");
+    xil_printf("================================================================\r\n");
+
+    if (dma_init() != XST_SUCCESS) return -1;
+    xil_printf("[DMA] init OK\r\n");
+    if (sd_mount() != XST_SUCCESS) return -1;
+    xil_printf("[SD ] mounted\r\n");
+
+    int total_fail = 0, sum_us = 0;
+
+    for (int tc = 0; tc < 5; tc++) {
+        char fn_in[16], fn_gold[16];
+        strcpy(fn_in,"pm_in_0.dat");   fn_in[6]='0'+tc;
+        strcpy(fn_gold,"pm_gold_0.dat"); fn_gold[8]='0'+tc;
+
+        xil_printf("\r\n################ Test case %d ################\r\n", tc);
+
+        if (sd_read_dat(fn_in,   in_buf,   N_IN_WORDS)  != XST_SUCCESS) break;
+        if (sd_read_dat(fn_gold, gold_buf, N_OUT_WORDS) != XST_SUCCESS) break;
+
+        // unpack in_buf -> sw_a (256), sw_b (256)
+        for (int i = 0; i < 128; i++) {
+            u32 wa = in_buf[i]       & 0xFFFFFF;
+            u32 wb = in_buf[i + 128] & 0xFFFFFF;
+            sw_a[2*i]   = wa & 0xFFF;  sw_a[2*i+1] = (wa>>12)&0xFFF;
+            sw_b[2*i]   = wb & 0xFFF;  sw_b[2*i+1] = (wb>>12)&0xFFF;
+        }
+
+        // ---- 硬體 PL: DMA 跑一次 ----
+        XTime t0,t1; XTime_GetTime(&t0);
+        if (dma_run() != XST_SUCCESS){total_fail++;continue;}
+        XTime_GetTime(&t1);
+        int us=(int)(1.0e6*(double)(t1-t0)/(double)COUNTS_PER_SECOND);
+        sum_us+=us;
+
+        // ---- PS 軟體: 一步步算同一條 pipeline ----
+        memcpy(sw_an, sw_a, sizeof(sw_a));
+        memcpy(sw_bn, sw_b, sizeof(sw_b));
+        sw_ntt(sw_an);                    // NTT(a)
+        sw_ntt(sw_bn);                    // NTT(b)
+        sw_pwm(sw_an, sw_bn, sw_cn);      // PWM
+        memcpy(sw_c, sw_cn, sizeof(sw_cn));
+        sw_intt(sw_c);                    // INTT -> 最終 c
+
+        // ---- Terminal 呈現五階段 ----
+        xil_printf("\r\n  --- Data flow (first %d binomials) ---\r\n", SHOW_ROWS);
+        print_stage("Stage 0: input  a", sw_a);
+        print_stage("Stage 0: input  b", sw_b);
+        print_stage("Stage 1: NTT(a) = a_hat", sw_an);
+        print_stage("Stage 1: NTT(b) = b_hat", sw_bn);
+        print_stage("Stage 2: PWM    = c_hat", sw_cn);
+        print_stage("Stage 3: INTT   = c (final)", sw_c);
+
+        // ---- 三方比對 ----
+        int err_hw_sw = 0, err_hw_gold = 0, err_sw_gold = 0;
+        for (int i = 0; i < 128; i++) {
+            u32 hw = out_buf[i] & 0xFFFFFF;
+            int hw_e = hw & 0xFFF, hw_o = (hw>>12)&0xFFF;
+            u32 gd = gold_buf[i] & 0xFFFFFF;
+            int gd_e = gd & 0xFFF, gd_o = (gd>>12)&0xFFF;
+            int sw_e = sw_c[2*i] % Q, sw_o = sw_c[2*i+1] % Q;
+
+            if ((hw_e%Q)!=(sw_e%Q) || (hw_o%Q)!=(sw_o%Q)) err_hw_sw++;
+            if ((hw_e%Q)!=(gd_e%Q) || (hw_o%Q)!=(gd_o%Q)) err_hw_gold++;
+            if ((sw_e%Q)!=(gd_e%Q) || (sw_o%Q)!=(gd_o%Q)) err_sw_gold++;
+        }
+
+        xil_printf("\r\n  --- Hardware PL result (first %d) ---\r\n", SHOW_ROWS);
+        for (int i = 0; i < SHOW_ROWS; i++) {
+            u32 hw = out_buf[i] & 0xFFFFFF;
+            xil_printf("     [%2d] %4d + %4d*X\r\n",
+                       i, hw & 0xFFF, (hw>>12)&0xFFF);
+        }
+
+        xil_printf("\r\n  --- 3-way verification (all 128 binomials) ---\r\n");
+        xil_printf("     PL hardware  vs  PS software : %s (%d diff)\r\n",
+                   err_hw_sw==0?"MATCH":"FAIL", err_hw_sw);
+        xil_printf("     PL hardware  vs  golden      : %s (%d diff)\r\n",
+                   err_hw_gold==0?"MATCH":"FAIL", err_hw_gold);
+        xil_printf("     PS software  vs  golden      : %s (%d diff)\r\n",
+                   err_sw_gold==0?"MATCH":"FAIL", err_sw_gold);
+
+        int pass = (err_hw_sw==0 && err_hw_gold==0 && err_sw_gold==0);
+        xil_printf("     latency = %d us (incl. SD+DMA)\r\n", us);
+        xil_printf("     >>> CASE %d  %s <<<\r\n", tc, pass?"PASS":"FAIL");
+        if (!pass) total_fail++;
+    }
+
+    xil_printf("\r\n================================================================\r\n");
+    if (total_fail==0)
+        xil_printf("  SUMMARY:  ALL PASS  (5/5 cases, avg %d us/poly-mul)\r\n",
+                   sum_us/5);
+    else
+        xil_printf("  SUMMARY:  %d / 5 cases FAILED\r\n", total_fail);
+    xil_printf("  Pure HW compute: 1647 cycles @ 90 MHz ~= 18.3 us\r\n");
+    xil_printf("  (NTT 499 + NTT 499 + PWM 138 + INTT 499 + overhead)\r\n");
+    xil_printf("================================================================\r\n");
+
+    while (1) { }
+    return 0;
+}
