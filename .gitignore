@@ -1,36 +1,24 @@
-# Vivado
+# Generated EDA outputs and local state
+.Xil/
+*.cache/
+*.runs/
+*.sim/
+*.hw/
+*.ip_user_files/
+build/
+runs/
+__pycache__/
+*.pyc
 *.log
 *.jou
-*.str
-*.debug
-*.prm
-*.backup.log
-*.backup.jou
-.Xil/
-
-# Vivado Project files to ignore (these are usually regenerated or contain local settings)
-KYBER_PM/Kyber_PM.cache/
-KYBER_PM/Kyber_PM.hw/
-KYBER_PM/Kyber_PM.ip_user_files/
-KYBER_PM/Kyber_PM.sim/
-KYBER_PM/Kyber_PM.runs/
-KYBER_PM/*.jou
-KYBER_PM/*.log
-
-# Simulation outputs
-xsim.dir/
-*.vcd
 *.wdb
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-env/
-.env
-
-# OS
+*.vcd
+*.vvp
+*.dcp
+*.bit
+*.bin
+*.zip
 .DS_Store
 Thumbs.db
+.env
+.env.*
